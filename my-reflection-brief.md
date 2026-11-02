@@ -1,90 +1,92 @@
-# Reflection Brief - Harness Engineering Capstone
+# Reflection Brief — Harness Engineering Capstone
 
 **Name:** Ayaan Rajak
 **Date:** 2nd Nov 2026
 
 **Environment**
 
-- Model(s): `claude-haiku-4-5-20251001` (System 1, per `summary.md`); recorded-response client, no live model call (System 4)
+- Model(s): `claude-haiku-4-5-20251001` for the live claims run; the context run uses the Anthropic token-count endpoint.
 - OS / Python: Linux, Python 3.13.0 (all four `pytest` headers)
-- Approx. API spend: ~$0.1181 for System 1's 8-claim run (per `summary.md`); System 2's compression calls cost ~12,334+347 and ~11,475+503 input/output tokens for the refund and subscription summaries respectively (per `budget.json`, dollar figure not itemized); System 4 ran fully offline via `--recorded-response`, $0 spend.
+- Approx. API spend: $0.1217 recorded for the eight-claim run; the other evidence records token counts but not a dollar total (`Build a Claims Intake Agent with a stop_reason-Driven Loop/exercises/03-dynamic-decomposition/solution/runs/20261102_082603/summary.md`).
 
 ---
 
-## Part 1 - Per-system
+## Part 1 — Per-system
 
-### System 1 - Agentic loop
+### System 1 — Agentic loop
 
-**1. Loop control.** The trace for `claim_01_kitchen_fire` shows: turn 1 `stop_reason: tool_use` (calls `lookup_policy`), turn 2 `stop_reason: tool_use` (six `record_claim_fact` calls), turn 3 `stop_reason: end_turn`. Termination is decided in `claims_intake/loop.py`, in the `run()` function: after each `client.messages.create(...)` call, it checks `if response.stop_reason == "end_turn": ... return FinalState(...)` to stop, and `if response.stop_reason == "tool_use": ...` to append tool results and continue the `while True:` loop. Nothing else drives the loop condition - no turn counter, no string match on the assistant's text.
+1. **Loop control.** Quote the `stop_reason` sequence from one trace. Name the file and function that decides continue-vs-stop, and how.
+   → The trace in `evidence/system1_agentic_loop/claim_01_kitchen_fire.jsonl` has `tool_use → tool_use → end_turn` across turns 1–3. The continue/stop decision is in `exercises/03-dynamic-decomposition/solution/claims_intake/loop.py`, function `run`: it continues only for `response.stop_reason == "tool_use"`, returns for `"end_turn"`, and raises `UnexpectedStopReason` otherwise. A `Budget` check is the safety net, not the primary loop condition.
 
-**2. Anti-pattern.** `test_antipatterns.py::test_no_integer_literal_iteration_cap_in_loop` checks (via AST analysis) that `loop.py` contains no `for _ in range(<int literal>)` or `while <var> < <int literal>` construct as its stopping mechanism. If the loop instead used a hardcoded cap like `for turn in range(3)`, claims like `claim_02_stolen_bike` and `claim_03_water_damage` - which needed 5 turns each to reach `end_turn` - would have been silently truncated mid-tool-call at turn 3, before `classify_claim`/`route_to_adjuster` ever ran, instead of terminating cleanly.
+2. **Anti-pattern.** Name one anti-pattern `test_antipatterns.py` checks for. What would break in your run if the loop used it?
+   → `tests/test_antipatterns.py` checks that the loop does not use string-membership tests against model text to control flow. If it did, a wording change in an assistant response could bypass the intended tool protocol or terminate incorrectly; the test suite would flag the AST pattern. The same test also rejects a literal iteration cap, preserving stop-reason-driven behavior.
 
-**3. Tool design.** `route_to_adjuster` and `escalate_to_human` have overlapping shape: both are marked "TERMINAL TOOL," both are meant to be called exactly once, and both carry a summary field (`claim_summary` vs. `structured_summary`) describing the same claim. Misrouting is prevented because both descriptions encode the identical numeric threshold: `route_to_adjuster` requires "classification confidence is at least 0.6," `escalate_to_human` fires when "confidence is below 0.6... or... cannot be routed safely." Since `classify_claim` already commits a single confidence number earlier in the loop, the two descriptions partition cleanly on that value with no ambiguous middle ground. Separately, `_t_lookup_policy` returns a structured error - `_err("permanent", False, f"policy_id {pid!r} not found")`, i.e. `{"is_error": true, "error_category": "permanent", "is_retryable": false, "message": "..."}` - instead of a bare string. The `is_retryable: false` field lets the agent immediately infer that retrying the same tool call is pointless and it should ask the claimant for a corrected ID or escalate, rather than looping on retries as it might if it only received an unstructured error string with no retry signal.
+3. **Tool design.** Pick two tools with overlapping inputs. How do the descriptions prevent misrouting? What did a structured tool error let the agent do that a generic string would not?
+   → `lookup_policy(policy_id)` and `record_claim_fact(field, value)` both accept identifiers/fields plus strings, but their descriptions distinguish lookup (“confirm the policy exists, what is covered, and the deductible”) from accumulation (“one normalized fact” used by routing) in `claims_intake/tools.py`. The schemas also give concrete examples and required fields, reducing model misrouting. Tool failures are structured JSON with `is_error`, `error_category`, and `is_retryable`, so the agent can retry transient failures or choose another action; a generic string would hide that decision signal (`exercises/02-tools-and-audit/README.md`).
 
-**4. Your numbers.** `claim_01_kitchen_fire`: 3 turns, 9,494 input / 566 output tokens, est. cost $0.0123, 5.9s elapsed (per `summary.md`). Compared against `claim_03_water_damage` in the same run - 5 turns, $0.0207, 11.8s - the difference is one `request_clarification` round trip (`clarifications_asked: 1`): each extra clarification adds a full turn (question out, claimant reply in) plus whatever prior context has already accumulated, which is why the more ambiguous claim costs roughly 1.7× as much as the straightforward one despite processing a comparably-sized incident.
+4. **Your numbers.** Quote the turn count and cost for one claim. How does it differ from the README sample, and why?
+   → For `claim_01_kitchen_fire`, the run summary records 3 turns, 9,373 input tokens, 483 output tokens, and `$0.0118` (`Build a Claims Intake Agent with a stop_reason-Driven Loop/exercises/03-dynamic-decomposition/solution/runs/20261102_082603/summary.md`). The exercise README’s sample says approximately `$0.05` for the whole run, whereas the completed eight-claim run totals `$0.1217`; that is a different scope and real API usage rather than the sample estimate (`Build a Claims Intake Agent with a stop_reason-Driven Loop/exercises/03-dynamic-decomposition/README.md`).
 
-### System 2 - Context strategy
+### System 2 — Context strategy
 
-**5. The reduction.** From `budget.json`: baseline 38,708 tokens → assembled 16,851 tokens, a 56.47% reduction. Per-section: `case_facts` 204, `resolved_refund` 360, `resolved_subscription` 516, `active` 15,789. The `active` section dominates (15,789 of 16,851 total, ~94%). It's kept verbatim per `assemble.py`'s design: the active issue sits at the bottom boundary, immediately before the model's next reply, and that's the position models attend to most reliably - any lossy compression there risks the very next turn hallucinating a detail from the just-happened exchange.
+5. **The reduction.** From `budget.json`: baseline tokens, assembled tokens, reduction %. Which section dominates the assembled context, and why keep it verbatim?
+   → `budget.json` reports 38,708 baseline tokens, 16,803 assembled tokens, and a 56.59% reduction (`evidence/system2_context_strategy/budget.json`). The `active` section dominates at 15,789 tokens because it is the live payment-method issue and contains the most recent conversational detail. It remains verbatim so details such as the exact failure code and user wording are not altered by summarization.
 
-**6. Summarize vs preserve.** The rule is enforced in `compressor.py::summarize_segment`: `if segment.status != "resolved": raise ValueError(...)` - only `resolved` segments are ever sent through the compression call; the active segment is structurally exempt. In numbers: the two resolved issues compressed down to 360 and 516 tokens each (they're finished, so only their factual conclusions matter going forward), while the active issue stayed at its full 15,789 tokens because the model must still reason over its turn-by-turn detail live.
+6. **Summarize vs preserve.** State the rule for what gets summarized vs kept byte-exact, citing your per-section token numbers.
+   → Summarize resolved segments and preserve the active segment byte-exact. The measured sections are `case_facts: 204`, `resolved_refund: 382`, `resolved_subscription: 446`, and `active: 15,789` tokens in `budget.json`; the active segment is also protected by the byte-exact assertion in `tests/test_assemble.py`. This keeps stable history compact while retaining current-work precision.
 
-**7. Facts block.** Comparing `eval.jsonl` to `eval_control.jsonl`: Q6 ("What is the structured status of the payment-method update issue?", expected fragment `in_progress`) passed in the full run - the model answered `payment_update_status: in_progress` - but failed in the control (case-facts block removed), where the model instead claimed "there is no case record with a structured status token for the payment-method update issue... remains in active conversation without a formal case token." All other 5 questions passed in both versions. This proves the persistent case-facts block is load-bearing specifically for that one structured field: the raw active-issue text is still present verbatim in the control, but without the redundant top-of-context facts block, the model can't reliably surface that particular structured token.
+7. **Facts block.** Compare `eval.jsonl` to `eval_control.jsonl`. Which question regressed, and what does that prove?
+   → Q6 regressed: the assembled run passed it with the exact token `in_progress`, while `eval_control.jsonl` failed and answered that no structured status token was available (`evidence/system2_context_strategy/eval.jsonl` and `eval_control.jsonl`). The control comparison proves the facts block is not cosmetic: placing structured facts in context makes a precise answer recoverable, while removing it causes a targeted factual failure even though Q1 still passed.
 
-### System 3 - Claude Code config
+### System 3 — Claude Code config
 
-**8. Path-scoped rules.** `.claude/rules/tests.md`'s frontmatter:
-```yaml
-paths:
-  - "**/*.test.tsx"
-  - "**/*.test.ts"
-```
-This is better than a directory-level `CLAUDE.md` for a cross-cutting convention like test-file rules, because co-located test files live scattered across `src/components/`, `src/pages/`, `src/api/`, and `src/db/` simultaneously (per the repo layout in `CLAUDE.md`). A directory-level file would need to be duplicated into every one of those directories, or hoisted to a shared ancestor that also picks up irrelevant files. One glob-scoped rule activates precisely when Claude touches a matching file, regardless of where in the tree it lives - confirmed by `test_ac_02_06_test_file_matches_react_and_tests`, which checks that a test file under `src/components/` correctly matches *both* the React rule and the tests rule at once.
+8. **Path-scoped rules.** Quote the glob frontmatter from one rule file. Why is it better than a directory-level CLAUDE.md for cross-cutting conventions?
+   → The API rule frontmatter quotes `paths:` followed by `- "src/api/**/*"` in `.claude/rules/api.md`. That is better than a directory-level `CLAUDE.md` for cross-cutting conventions because the rule activates by file pattern wherever matching files live, including tests or future layout changes, without creating nested instruction hierarchies. The validator evidence confirms API, React, and test matching behavior (`evidence/system3_claude_config/pytest_S3.log`).
 
-**9. Forked skill.** `.claude/skills/deploy-check/SKILL.md` frontmatter:
-```yaml
-context: fork
-allowed-tools:
-  - Read
-  - Grep
-  - Glob
-  - Bash(git status:*)
-  - Bash(git diff:*)
-  - Bash(git log:*)
-  - Bash(git rev-parse:*)
-  - Bash(git ls-files:*)
-  - Bash(gh pr view:*)
-  - Bash(gh pr checks:*)
-```
-Running forked keeps the verbose intermediate output - file enumeration, diff parsing, `git status` noise - out of the main session; only the structured pass/fail summary returns. Read-only `allowed-tools` means the check structurally cannot push, deploy, or modify files, even if the model tried. Without `context: fork`, every deploy check would dump raw git output into the calling session's context on every invocation, burning tokens and drowning the actual conversation. Without the read-only allowlist, a future edit to the skill file could silently grant `Write` and the check would gain the ability to modify state during what's supposed to be pure verification - the skill file itself says exactly this: "even if a future maintainer adds `Write` here, the team's `/review` command should catch the change."
+9. **Forked skill.** Quote the `context: fork` and `allowed-tools` lines. What does running forked + read-only buy you? What breaks without it?
+   → `.claude/skills/deploy-check/SKILL.md` declares `context: fork` and an allowlist beginning with `allowed-tools: Read, Grep, Glob` plus read-only Git/GitHub commands. Forking keeps verbose discovery output out of the parent session, while the allowlist prevents mutation, pushes, or deployment; without either, a deploy check could pollute the main context and acquire unsafe write capability. The file explicitly states that it returns only a structured pass/fail summary.
 
-**10. Scope.** Validator output: `OK` (exit 0), confirming the hierarchy resolves cleanly. Project-level example: `./CLAUDE.md` plus `.claude/rules/*.md` (e.g. `api.md`, `react.md`, `tests.md`) - shared via git, loaded into every teammate's session automatically. User-level example: `~/.claude/skills/deploy-check-strict/` - the skill file itself documents this: "If you want a stricter personal variant... create a parallel skill in `~/.claude/skills/deploy-check-strict/`... Your variant will not affect teammates and will not be committed to the repo."
+10. **Scope.** From the validator output: project-level vs user-level scope. Give one example of each from this config.
+    → The validator output is `OK`, and the 35-test log shows the scope checks passed (`evidence/system3_claude_config/validator_output.txt`, `pytest_S3.log`). Project-level examples are `./CLAUDE.md` and `.claude/skills/deploy-check/`, committed and shared with the team. User-level examples are `~/.claude/CLAUDE.md` and `~/.claude/skills/deploy-check-strict/`, described in `CLAUDE.md` as personal and not versioned.
 
-### System 4 - Orchestration
+### System 4 — Orchestration
 
-**11. Push work down.** The shift run printed `shift C: 0 new defects` against a warm tier seeded with 40 total defect rows (`fixtures/defects.json`). The named indexed query is `WarmStore.defects_since()` in `shift_monitor/warm.py`: `SELECT * FROM defects WHERE ts > ? ORDER BY ts DESC LIMIT ?`, run against an indexed `ts` column. The model never sees the full 40-row history because `gather_new_defects` is a pure passthrough to this SQL call with no Python-side filtering (confirmed by `test_gather_new_defects_has_no_python_side_filtering`) - the `WHERE`/`LIMIT` happen inside SQLite before any row reaches the prompt, so only whatever handful of rows matched the time window ever gets built into context, regardless of how large the warm tier grows over months of shifts.
+11. **Push work down.** Defects the SQL query returned vs warm-tier total. Name the indexed query. Why does the model never see the full history?
+    → The indexed query returns 17 April defects from the fixture, while the warm-tier test also verifies `limit=5` is respected (`tests/test_us01_tiered_state.py`). The query is `SELECT * FROM defects WHERE ts > ? ORDER BY ts DESC LIMIT ?` in `shift_monitor/warm.py`, and `EXPLAIN QUERY PLAN` must show `idx_defects_shift_ts`. Filtering, ordering, and limiting happen in SQLite, so the model receives only the selected defect rows rather than the full warm history.
 
-**12. Crash recovery.** `recovery.py` sets `STALE_RESUME_THRESHOLD_MINUTES = 30`. `decide()` returns `"resume"` only when the manifest has incomplete steps and `now - last_step.ts <= 30 minutes`; otherwise `"fresh"`. The test suite pins the boundary exactly: `test_recovery_decide_truth_table[30-False-resume]` and `[31-False-fresh]` confirm the cutoff is inclusive at 30 minutes. A fresh restart with an injected summary is more reliable past that window because the working set has likely moved on - a new shift's data may have arrived, or a root cause may already be understood - so blindly resuming risks reasoning over context that no longer matches reality, whereas a fresh start with a compact summary of what the crashed run already found discards only the stale partial reasoning, not the actual findings.
+12. **Crash recovery.** The resume-vs-fresh decision and its staleness threshold (`recovery.py`). Why is a fresh start with an injected summary sometimes more reliable than resuming?
+    → `recovery.py` resumes only when the manifest is incomplete, non-empty, and the last step is no more than 30 minutes old; otherwise it starts fresh. The truth-table tests verify 30 minutes resumes and 31 minutes starts fresh (`tests/test_us03_crash_recovery.py`). Fresh is sometimes safer because a stale partial may reflect an obsolete working set, while a new invocation can receive the manifest’s captured findings as a concise injected summary instead of replaying corrupted or outdated conversational state.
 
-**13. Small state.** `data/hot_state.json` is 643 bytes, well under the ~5 KB budget. This matters because `shift_monitor` runs once per shift indefinitely - the same file is read and rewritten on every future invocation forever. `HotState` structurally caps this (`test_hotstate_rejects_more_than_20_hashes`): without that cap, `recent_defect_hashes` would grow without bound as more shifts ran, and every future shift's prompt would get proportionally larger, slower, and more expensive. Keeping it near-constant (643 B today, regardless of how many shifts preceded it) is what keeps the system's per-invocation cost flat over its entire operational lifetime instead of growing linearly with shift count.
+13. **Small state.** Byte size of your `hot_state.json`. Why does the budget matter for a system run once per shift, indefinitely?
+    → The captured `hot_state.json` is 643 bytes (`evidence/system4_orchstration/hot_state_size.txt`), under the 5,120-byte budget enforced by `HotState.write_atomic` in `shift_monitor/state.py`. A shift-run system operates indefinitely, so an unbounded hot state would eventually crowd out current defects and increase prompt cost or exceed model context. The budget makes the long-lived state predictable and the atomic replacement prevents partial writes.
 
 ---
 
-## Part 2 - Synthesis
+## Part 2 — Synthesis
 
-**14. Three layers.**
-- **Model:** `claims_intake/tools.py`'s `TOOL_SCHEMAS` (e.g. `classify_claim`'s enum-constrained `input_schema`) - this is literally what Claude is told it can do; the model layer is the reasoning inside Claude, exposed only through what the tools and prompts describe.
-- **Harness:** `claims_intake/loop.py`'s `run()` function - the `stop_reason`-driven `while True:` loop, budget checks, and tool-result feedback - decides when to call the model again and when to stop.
-- **Orchestration:** `shift_monitor/recovery.py` + `manifest.py` + `fork.py` - session-level concerns spanning multiple invocations over time (crash recovery, fork-and-merge, tiered warm/cold state) that exist above any single agentic loop.
+14. **Three layers.** Point to a file/artifact for each layer and justify.
+    → Model: `budget.json` and `claim_01_kitchen_fire.jsonl` show the model using compressed context and stop-reason/tool calls rather than receiving an undifferentiated transcript.
+    → Harness: `claims_intake/loop.py` and `.claude/skills/deploy-check/SKILL.md` enforce protocol control, fork isolation, and read-only tools.
+    → Orchestration: `warm.py`, `recovery.py`, and `state.py` provide indexed retrieval, crash decisions, bounded state, and atomic persistence. These are separate artifacts because the model chooses actions, the harness constrains actions, and orchestration controls durable history.
 
-**15. Deterministic vs prompt.** Deterministic (enforced in code): System 4's `HotState` size cap (`test_hotstate_rejects_more_than_20_hashes`, `write_atomic`) guarantees `hot_state.json` never exceeds budget no matter what the model outputs; System 3's `deploy-check` `allowed-tools` allowlist (no `Write`) makes it structurally impossible for the skill to push or deploy. Prompt-guided: System 1's `confidence >= 0.6` threshold between `classify_claim`/`route_to_adjuster` and `escalate_to_human` - nothing in `loop.py` enforces that number in code; the model is trusted to follow it. Enforce in code when a failure is catastrophic or invisible until too late (state bloat, an unauthorized write); use prompt guidance when the decision is genuinely judgment-based over ambiguous, case-specific facts, where a hard rule would misfire on edge cases.
+15. **Deterministic vs prompt.** Cite one behavior guaranteed in code (terminal tool, read-only allowlist, atomic write, byte budget) and one guided by prompt. When is each right?
+    → A behavior guaranteed in code is the read-only deploy allowlist (`SKILL.md`) and the atomic, budget-checked hot-state write (`state.py`); tests can verify these without trusting model wording. A prompt-guided behavior is asking one clarification only when claim type is genuinely ambiguous, as specified by `tools.py` descriptions. Deterministic enforcement is right for safety and invariants; prompts are right for semantic judgment where rigid branching would make the harness own domain decisions.
 
-**16. Context, two faces.** System 2 compresses *within* one continuous conversation: resolved segments shrink to 516/360 tokens, `case_facts` stays a fixed 204-token block, the active segment stays byte-exact at 15,789 tokens - 38,708 → 16,851 total (56.47% reduction), all inside one transcript. System 4 compresses *across* invocations that don't even share a process: each shift is a fresh CLI call, so instead of summarizing a transcript, it filters at the SQL layer before anything reaches a prompt (`defects_since()`'s indexed `WHERE ts > ?`) and persists only a fixed ~5 KB snapshot (643 bytes actual) between runs - no conversation history at all survives between shifts. Same principle - never make the model re-read more than it needs right now - different mechanism: summarize-and-position text within one window vs. filter-at-the-source and persist a tiny structured snapshot between windows that don't overlap in time.
+16. **Context, two faces.** Compare context management in System 2 (intra-session) and System 4 (cross-session) with cited numbers from both. Same principle, different mechanism — how?
+    → System 2 reduces 38,708 baseline tokens to 16,803 assembled tokens, preserving the active segment; System 4 reduces cross-shift state to a 643-byte hot file and retrieves only bounded SQL results (`budget.json`, `hot_state_size.txt`). Both apply the same principle—keep the smallest reliable working set—but System 2 transforms one session’s transcript, while System 4 persists and queries state across sessions and shifts.
 
-**17. Reliability you can't see in one run.** `test_recovery_decide_truth_table`'s boundary cases (`[30-False-resume]`, `[31-False-fresh]`) and `test_hotstate_rejects_more_than_20_hashes` guarantee behavior at exact edges that a single successful run would never exercise - a lucky shift with only 3 defect hashes, or a crash recovered at minute 5, looks identical whether or not the 20-hash cap or the 30-minute boundary is implemented correctly at all. This matters before shipping because production shifts will eventually land exactly on these edges (a bad week with >20 distinct defects; a crash recovered at minute 31), and you want confidence those paths work before the first time they happen for real.
+17. **Reliability you can't see in one run.** Name one behavior a test guarantees that a single successful run would not reveal. Why does it matter before shipping?
+    → The crash-recovery tests guarantee behavior a successful run would not reveal: a 30-minute incomplete manifest resumes, a 31-minute one starts fresh, and a complete manifest always starts fresh (`tests/test_us03_crash_recovery.py`). A single healthy run exercises neither the crash boundary nor stale-state path. Shipping without this guarantee could silently resume obsolete work after an outage and produce misleading shift conclusions.
 
-**18. Blast radius.** System 3's `deploy-check`: its `allowed-tools` are entirely read-only (`Read`/`Grep`/`Glob`/`Bash(git status|diff|log|rev-parse|ls-files:*)`/`Bash(gh pr view|checks:*)`), so it structurally cannot push, deploy, write files, or run migrations even if the model tried - worst case is a human trusts a wrong pass/fail verdict and ships anyway. The kill switch is the `allowed-tools` list itself: since it's config, not code the skill can rewrite, tightening or removing it (or deleting the skill file from `.claude/skills/`) instantly and completely disables any capability beyond read-only inspection - no runtime flag needed, because the enforcement point is the tool-availability boundary Claude Code checks before any tool call is dispatched.
+18. **Blast radius.** Pick one system. What's the blast radius if it misbehaves, and what's the kill switch? Ground it in that system's tools, enforcement points, and state.
+    → System 4 has the largest blast radius: a bad retrieval or stale state could cause an entire shift’s quality-monitoring decision to miss defects or recommend the wrong quarantine. Its controls are the indexed `defects_since` query with a row limit, the 5,120-byte hot-state budget, atomic writes, the 30-minute recovery threshold, and the single shift invocation tested in `pytest_S4.log`. The practical kill switch is to stop the scheduled shift invocation and inspect the durable warm/cold records before resuming.
 
-**19. What broke.** System 1's venv installed `httpx>=0.28`, which dropped the `proxies` kwarg that `anthropic==0.39.0`'s client init relies on, raising `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'` inside `client.py`'s `make_client()`. Fixed by pinning `httpx==0.27.2`/`httpcore==1.0.5` in that venv specifically. Applying that same fix inside System 2's venv then broke it a second way: `anthropic==0.39.0` has no `messages.count_tokens` method, so `retail_context/tokens.py`'s `count()` raised `AttributeError: 'Messages' object has no attribute 'count_tokens'`. Fixed by reinstalling `anthropic==0.69.0` specifically in System 2's venv - underscoring that each system's SDK pin is load-bearing and not interchangeable across environments.
+---
 
-**20. What you'd change.** I'd pin exact `httpx`/`httpcore` versions (or ship a lockfile) in each system's own `pyproject.toml` instead of leaving them as unpinned transitive dependencies. Leaving pip free to resolve "whatever's newest" is exactly what caused the `proxies` `TypeError`, and cost two separate debugging cycles across two different systems before landing on the right combination for each.
+## Part 3 — Honest assessment
+
+19. **What broke.** One thing that failed first try in your environment, and how you fixed it. (If nothing, what you checked to be sure.)
+    → Nothing in the completed artifacts shows a failed first attempt; I checked the evidence logs and all recorded final suites are green: 30 tests for System 1, 35 for System 3, and 33 for System 4 (`evidence/system1_agentic_loop/pytest_S1.log`, `pytest_S3.log`, `pytest_S4.log`).
+
+20. **What you'd change.** One architectural decision you'd make differently, grounded in what you observed.
+    → I would make the cost/telemetry contract a first-class shared artifact instead of recording dollar cost only in the claims summary. The context pipeline has authoritative token counts and the orchestration pipeline has testable state sizes, but neither joins usage, latency, and cost into one run manifest (`budget.json`, `summary.md`, and `shift_run_output.txt`). A shared run ledger would make cross-system cost regressions and operational trade-offs visible before deployment without changing the existing correctness boundaries.
